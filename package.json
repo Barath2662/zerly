@@ -1,0 +1,171 @@
+{
+  "name": "zerly-ai",
+  "displayName": "Zerly AI",
+  "description": "Understand your code. Not just generate it. — Developer intelligence assistant for codebase understanding, architecture visualization, risk detection, and AI code explanation.",
+  "version": "0.1.0",
+  "publisher": "zerly",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Visualization",
+    "Education",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "code understanding",
+    "architecture",
+    "developer tools",
+    "code analysis",
+    "risk detection"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "icon": "assets/zerly-icon.png",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "zerly-sidebar",
+          "title": "Zerly AI",
+          "icon": "assets/zerly-sidebar.svg"
+        }
+      ]
+    },
+    "views": {
+      "zerly-sidebar": [
+        {
+          "type": "webview",
+          "id": "zerly.mainView",
+          "name": "Zerly AI"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "zerly.analyzeProject",
+        "title": "Zerly: Analyze Project"
+      },
+      {
+        "command": "zerly.architectureMap",
+        "title": "Zerly: Architecture Map"
+      },
+      {
+        "command": "zerly.featureFlow",
+        "title": "Zerly: Feature Flow Explorer"
+      },
+      {
+        "command": "zerly.riskScanner",
+        "title": "Zerly: Risk Scanner"
+      },
+      {
+        "command": "zerly.explainCode",
+        "title": "Zerly: Explain Code"
+      },
+      {
+        "command": "zerly.learningMode",
+        "title": "Zerly: Learning Mode"
+      },
+      {
+        "command": "zerly.chat",
+        "title": "Zerly: Chat with Zerly"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "zerly.explainCode",
+          "group": "zerly",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Zerly AI",
+      "properties": {
+        "zerly.openRouterApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Your OpenRouter API key for AI-powered analysis.",
+          "markdownDescription": "Your [OpenRouter](https://openrouter.ai/) API key for AI-powered code analysis."
+        },
+        "zerly.aiModel": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "qwen/qwen3-coder:free",
+            "qwen/qwen3-next-80b-a3b-instruct:free",
+            "liquid/lfm-2.5-1.2b-thinking:free",
+            "qwen/qwen3-4b:free",
+            "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+            "stepfun/step-3.5-flash:free",
+            "arcee-ai/trinity-large-preview:free",
+            "nvidia/nemotron-3-nano-30b-a3b:free",
+            "qwen/qwen3-vl-235b-a22b-thinking"
+          ],
+          "enumDescriptions": [
+            "Auto — Zerly picks the best free model per task (recommended)",
+            "Qwen3 Coder — Best for code explanation and review",
+            "Qwen3 Next 80B — Large model for complex analysis",
+            "Liquid LFM 2.5 1.2B Thinking — Lightweight, fast reasoning",
+            "Qwen3 4B — Small, fast general use",
+            "NVIDIA LLaMA Nemotron Embed VL 1B — NVIDIA model",
+            "StepFun Step 3.5 Flash — Fast responses",
+            "Arcee Trinity Large — Large preview model",
+            "NVIDIA Nemotron Nano 30B — NVIDIA medium model",
+            "Qwen3 VL 235B Thinking — Largest model for deep architecture reasoning"
+          ],
+          "description": "AI model override. 'auto' lets Zerly pick the best free model per task."
+        },
+        "zerly.customApiProvider": {
+          "type": "string",
+          "default": "openrouter",
+          "enum": [
+            "openrouter",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "OpenRouter — Free AI models (default, no setup needed)",
+            "Custom — Use your own OpenAI-compatible API endpoint"
+          ],
+          "description": "Choose your LLM API provider."
+        },
+        "zerly.customApiEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Custom OpenAI-compatible API endpoint (e.g. http://localhost:11434/v1). Only used when provider is 'custom'."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build:all",
+    "build": "node esbuild.config.js",
+    "watch": "node esbuild.config.js --watch",
+    "build:webview": "node esbuild.webview.config.js",
+    "build:all": "node esbuild.config.js && node esbuild.webview.config.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@vscode/codicons": "^0.0.44",
+    "mermaid": "^11.0.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brittytino/zerly"
+  }
+}
