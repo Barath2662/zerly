@@ -105,6 +105,14 @@
       {
         "command": "zerly.refresh",
         "title": "Zerly: Refresh"
+      },
+      {
+        "command": "zerly.resetSession",
+        "title": "Zerly: Reset Session and Cache"
+      },
+      {
+        "command": "zerly.diagnostics",
+        "title": "Zerly: Open Connection Diagnostics"
       }
     ],
     "menus": {
@@ -160,14 +168,18 @@
     "build": "node esbuild.config.js",
     "watch": "node esbuild.config.js --watch",
     "build:webview": "node esbuild.webview.config.js",
-    "build:all": "node esbuild.config.js && node esbuild.webview.config.js"
+    "build:all": "node esbuild.config.js && node esbuild.webview.config.js",
+    "test": "jest"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^20.0.0",
     "@types/react": "^18.0.0",
     "@types/react-dom": "^18.0.0",
     "@types/vscode": "^1.85.0",
     "esbuild": "^0.20.0",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
     "typescript": "^5.0.0"
   },
   "dependencies": {

@@ -4,6 +4,7 @@ import { DependencyGraph } from './dependencyGraph';
 import { RiskAnalyzer } from './riskAnalyzer';
 import { FlowAnalyzer } from './flowAnalyzer';
 import { AIService } from './aiService';
+import { ZerlyKeyManager, zerlyLog } from './zerlyKeyManager';
 
 const CACHE_KEY = 'zerly.cachedScanData';
 const CACHE_TIMESTAMP_KEY = 'zerly.cachedScanTimestamp';
@@ -16,6 +17,10 @@ const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 export class ZerlySidebarProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _pendingMessages: any[] = [];
+  /** Disposable for the onKeyChanged subscription — cleaned up on dispose. */
+  private _keyChangedDisposable: vscode.Disposable;
+  /** How many key-change listeners are currently registered (always 1 after construction). */
+  private _listenerCount = 0;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -24,8 +29,43 @@ export class ZerlySidebarProvider implements vscode.WebviewViewProvider {
     private readonly _depGraph: DependencyGraph,
     private readonly _riskAnalyzer: RiskAnalyzer,
     private readonly _flowAnalyzer: FlowAnalyzer,
-    private readonly _aiService: AIService
-  ) {}
+    private readonly _aiService: AIService,
+    private readonly _keyManager: ZerlyKeyManager
+  ) {
+    // When the API key changes, immediately clear caches and notify the webview
+    // so it re-renders with the new auth state and fresh (empty) data.
+    this._keyChangedDisposable = _keyManager.onKeyChanged.event((key) => {
+      zerlyLog('cache-invalidated', 'All caches cleared after key change', {
+        meta: { keyVersion: _keyManager.keyVersion, hasKey: Boolean(key) },
+      });
+      this.clearAllCaches();
+      // Tell webview to wipe rendered results immediately so nothing stale shows.
+      this.postMessage({ command: 'clearResults' });
+      this.postMessage({
+        command: 'apiStatus',
+        data: { hasKey: Boolean(key) },
+      });
+      this.postMessage({ command: 'apiKeySet', success: Boolean(key) });
+    });
+    this._listenerCount = 1;
+  }
+
+  /** Number of onKeyChanged listeners currently registered. */
+  getListenerCount(): number {
+    return this._listenerCount;
+  }
+
+  /** Clears every persisted cache entry. Safe to call at any time. */
+  public clearAllCaches(): void {
+    const keys = [
+      CACHE_KEY, CACHE_TIMESTAMP_KEY,
+      ARCH_CACHE_KEY, ARCH_CACHE_TIMESTAMP_KEY,
+      RISK_CACHE_KEY, RISK_CACHE_TIMESTAMP_KEY,
+    ];
+    for (const k of keys) {
+      this._context.workspaceState.update(k, undefined);
+    }
+  }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -40,6 +80,13 @@ export class ZerlySidebarProvider implements vscode.WebviewViewProvider {
     };
 
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
+
+    // Abort all in-flight AI requests when the webview panel is destroyed.
+    webviewView.onDidDispose(() => {
+      this._view = undefined;
+      zerlyLog('webview-disposed', 'Webview closed — aborting all in-flight requests');
+      this._aiService.invalidateAll();
+    });
 
     // Handle messages from webview
     webviewView.webview.onDidReceiveMessage(async (message) => {
@@ -232,13 +279,14 @@ export class ZerlySidebarProvider implements vscode.WebviewViewProvider {
         const key = await vscode.window.showInputBox({
           prompt: 'Enter your Zerly API key from zerly.tinobritty.me',
           password: true,
-          placeHolder: 'zerly-...',
+          placeHolder: 'sk_zerly_...',
         });
         if (key) {
-          await vscode.workspace
-            .getConfiguration('zerly')
-            .update('zerlyApiKey', key, vscode.ConfigurationTarget.Global);
-          this.postMessage({ command: 'apiKeySet', success: true });
+          const result = await this._keyManager.setKey(key);
+          if (!result.ok) {
+            vscode.window.showWarningMessage(`Zerly: ${result.error}`);
+            break;
+          }
           vscode.window.showInformationMessage('Zerly: API key saved! AI features are ready.');
         }
         break;
@@ -255,19 +303,20 @@ export class ZerlySidebarProvider implements vscode.WebviewViewProvider {
           vscode.window.showWarningMessage('Zerly: Clipboard is empty. Copy your API key and try again.');
           break;
         }
-        await vscode.workspace
-          .getConfiguration('zerly')
-          .update('zerlyApiKey', clipboardText, vscode.ConfigurationTarget.Global);
-        this.postMessage({ command: 'apiKeySet', success: true });
-        vscode.window.showInformationMessage('Zerly: API key saved from clipboard.');
+        const result = await this._keyManager.setKey(clipboardText);
+        if (!result.ok) {
+          vscode.window.showWarningMessage(`Zerly: ${result.error}`);
+          break;
+        }
+        vscode.window.showInformationMessage('Zerly: API key saved from clipboard. AI features are ready.');
         break;
       }
 
       case 'getApiStatus': {
-        const hasKey = this._aiService.getApiKey().length > 0;
+        const hasKey = this._keyManager.hasKey();
         this.postMessage({
           command: 'apiStatus',
-          data: { hasKey, isDefault: !vscode.workspace.getConfiguration('zerly').get<string>('zerlyApiKey') },
+          data: { hasKey, isDefault: !hasKey },
         });
         break;
       }

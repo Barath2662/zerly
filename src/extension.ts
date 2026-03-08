@@ -8,22 +8,29 @@ import { AIService } from './aiService';
 import { AuthManager } from './authManager';
 import { SubscriptionManager } from './subscriptionManager';
 import { UsageTracker } from './usageTracker';
+import { ZerlyKeyManager, getLogBuffer, zerlyLog } from './zerlyKeyManager';
 
 let sidebarProvider: ZerlySidebarProvider;
 
-export function activate(context: vscode.ExtensionContext) {
-  console.log('Zerly AI is activating...');
+export async function activate(context: vscode.ExtensionContext) {
+  zerlyLog('activate', 'Zerly AI is activating...');
+
+  // ── Key Manager (initialize before anything else) ──────────────────────────
+  const keyManager = ZerlyKeyManager.getInstance(context);
+  await keyManager.initialize();
+  context.subscriptions.push({ dispose: () => keyManager.dispose() });
 
   // ── Monetization services ──────────────────────────────────────────────────
   const auth = AuthManager.getInstance(context);
+  auth.setKeyManager(keyManager);
   const subManager = SubscriptionManager.getInstance(auth);
   const usageTracker = UsageTracker.getInstance(context, auth, subManager);
 
-  // Register the URI handler so GitHub OAuth deep-links arrive back here:
-  // vscode://zerlyai.zerly/auth?token=...
-  context.subscriptions.push(
-    vscode.window.registerUriHandler(auth)
-  );
+  // Register the URI handler exactly once — disposed on deactivate.
+  // Handles vscode://...?key=... (API key) and vscode://...?token=... (GitHub OAuth).
+  const uriHandlerDisposable = vscode.window.registerUriHandler(auth);
+  context.subscriptions.push(uriHandlerDisposable);
+  zerlyLog('uri-handler-registered', 'Deep-link URI handler registered (single instance)');
 
   // ── Core services ──────────────────────────────────────────────────────────
   const scanner = new ProjectScanner();
@@ -32,6 +39,7 @@ export function activate(context: vscode.ExtensionContext) {
   const flowAnalyzer = new FlowAnalyzer();
   const aiService = new AIService();
   aiService.setExtensionPath(context.extensionUri.fsPath);
+  aiService.setKeyManager(keyManager);
 
   sidebarProvider = new ZerlySidebarProvider(
     context.extensionUri,
@@ -40,7 +48,8 @@ export function activate(context: vscode.ExtensionContext) {
     depGraph,
     riskAnalyzer,
     flowAnalyzer,
-    aiService
+    aiService,
+    keyManager
   );
 
   context.subscriptions.push(
@@ -48,7 +57,76 @@ export function activate(context: vscode.ExtensionContext) {
       webviewOptions: { retainContextWhenHidden: true },
     })
   );
+  // ── Reset Session command ─────────────────────────────────────────────────────────
+  context.subscriptions.push(
+    vscode.commands.registerCommand('zerly.resetSession', async () => {
+      const CLEAR_KEY_LABEL = 'Clear caches and sign out';
+      const KEEP_KEY_LABEL = 'Clear caches only (keep key)';
+      const pick = await vscode.window.showQuickPick(
+        [KEEP_KEY_LABEL, CLEAR_KEY_LABEL],
+        { placeHolder: 'Zerly: Reset Session — what would you like to clear?' }
+      );
+      if (!pick) return;
 
+      sidebarProvider.clearAllCaches();
+      aiService.invalidateAll();
+      zerlyLog('key-changed-cache-cleared', `Session reset (${pick})`);
+
+      if (pick === CLEAR_KEY_LABEL) {
+        await keyManager.clearKey();
+        vscode.window.showInformationMessage('Zerly: Session cleared and signed out.');
+      } else {
+        // Notify webview to re-fetch with fresh state
+        sidebarProvider.postMessage({ command: 'sessionReset' });
+        vscode.window.showInformationMessage('Zerly: Session caches cleared. Ready for fresh analysis.');
+      }
+    })
+  );
+
+  // ── Diagnostics command ──────────────────────────────────────────────────────────
+  context.subscriptions.push(
+    vscode.commands.registerCommand('zerly.diagnostics', () => {
+      const logs = getLogBuffer();
+      const last20 = logs.slice(-20);
+      const logText = last20
+        .map(e => {
+          const time = new Date(e.ts).toISOString().slice(11, 23);
+          const rid = e.requestId ? ` [${e.requestId.slice(0, 8)}]` : '';
+          const st = e.status !== undefined ? ` HTTP:${e.status}` : '';
+          return `${time}${rid} [${e.source}]${st} ${e.message}`;
+        })
+        .join('\n');
+
+      const lastReq = aiService.getLastRequestInfo();
+      const lastReqStr = lastReq
+        ? `${lastReq.requestId.slice(0, 8)} HTTP:${lastReq.status ?? '?'} @ ${new Date(lastReq.ts).toISOString().slice(11, 23)}`
+        : '(none)';
+
+      const lastAuthTs = auth.getLastAuthUriTimestamp();
+      const lastAuthStr = lastAuthTs
+        ? new Date(lastAuthTs).toISOString()
+        : '(never)';
+
+      const diagnosticInfo = [
+        `─── Zerly AI Diagnostics ───`,
+        `Key present      : ${keyManager.hasKey()}`,
+        `Key (masked)     : ${keyManager.maskedKey()}`,
+        `Key version      : ${keyManager.keyVersion}`,
+        `In-flight count  : ${aiService.getInflightCount()}`,
+        `Last request     : ${lastReqStr}`,
+        `Listeners (key)  : ${sidebarProvider.getListenerCount()}`,
+        `Last auth URI    : ${lastAuthStr}`,
+        `─── Recent Logs (last 20) ───`,
+        logText || '(no logs yet)',
+      ].join('\n');
+
+      // Show in a new text document so the user can copy/paste it
+      vscode.workspace.openTextDocument({
+        language: 'plaintext',
+        content: diagnosticInfo,
+      }).then(doc => vscode.window.showTextDocument(doc));
+    })
+  );
   // ── Auth commands ──────────────────────────────────────────────────────────
 
   context.subscriptions.push(
@@ -200,8 +278,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // Show appropriate startup notification based on whether an API key is set
-  const zerlyKey = vscode.workspace.getConfiguration('zerly').get<string>('zerlyApiKey');
-  if (zerlyKey?.trim()) {
+  if (keyManager.hasKey()) {
     vscode.window.showInformationMessage(
       "Hey, I'm Zerly. Give me a moment to understand your codebase. 🧠"
     );
@@ -216,7 +293,10 @@ export function activate(context: vscode.ExtensionContext) {
     });
   }
 
-  console.log('Zerly AI activated successfully.');
+  // Validate key against backend in the background (non-blocking)
+  validateKeyOnStartup(keyManager, sidebarProvider);
+
+  zerlyLog('activate', 'Zerly AI activated successfully.');
 }
 
 async function runAnalyzeProject(
@@ -254,5 +334,48 @@ async function runAnalyzeProject(
 }
 
 export function deactivate() {
-  console.log('Zerly AI deactivated.');
+  zerlyLog('deactivate', 'Zerly AI deactivated.');
+}
+
+/**
+ * Validates the stored API key against the Zerly backend on startup.
+ * If the key is invalid (401/403), clears dependent caches and shows a reconnect CTA.
+ * Runs asynchronously so it never blocks extension activation.
+ */
+async function validateKeyOnStartup(
+  keyManager: ZerlyKeyManager,
+  sidebar: ZerlySidebarProvider
+): Promise<void> {
+  const key = keyManager.getCachedKey();
+  if (!key) return;  // No key — user hasn't connected yet
+
+  try {
+    const response = await fetch('https://zerly.tinobritty.me/api/status', {
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'Cache-Control': 'no-store',
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    zerlyLog('startup-validation', `Status check`, { status: response.status });
+
+    if (response.status === 401 || response.status === 403) {
+      // Key is rejected — clear auth-dependent caches and prompt reconnect
+      sidebar.clearAllCaches();
+      sidebar.postMessage({ command: 'apiStatus', data: { hasKey: false } });
+      vscode.window.showWarningMessage(
+        'Zerly: Your API key has expired or is invalid. Please reconnect.',
+        'Reconnect'
+      ).then(action => {
+        if (action === 'Reconnect') {
+          vscode.env.openExternal(vscode.Uri.parse('https://zerly.tinobritty.me/connect'));
+        }
+      });
+    }
+    // 2xx or other non-401 responses: key is fine
+  } catch {
+    // Network down or endpoint not available — non-fatal, skip validation
+    zerlyLog('startup-validation', 'Status check skipped (network/timeout)');
+  }
 }

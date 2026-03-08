@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { ScanResult } from './scanner';
+import { ZerlyKeyManager, zerlyLog, generateRequestId } from './zerlyKeyManager';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -38,20 +39,52 @@ const ZERLY_DEFAULT_MODEL = 'zerly/zerlino-32b';
 
 export class AIService {
   private _extensionPath: string = '';
+  private _keyManager: ZerlyKeyManager | null = null;
 
   setExtensionPath(extPath: string) {
     this._extensionPath = extPath;
   }
 
-  // ── API Key Resolution (priority: user zerlyApiKey setting > customModelApiKey) ──
+  /**
+   * Wire up the ZerlyKeyManager so the service always uses the latest key.
+   * When the key changes, all in-flight requests are cancelled.
+   */
+  setKeyManager(km: ZerlyKeyManager): void {
+    this._keyManager = km;
+    km.onKeyChanged.event(() => {
+      zerlyLog('key-changed-cache-cleared', 'Key changed — aborting all in-flight AI requests');
+      this.invalidateAll();
+    });
+  }
 
+  /** Abort every in-flight request immediately (called on key rotation). */
+  invalidateAll(): void {
+    for (const controller of this._taskControllers.values()) {
+      controller.abort();
+    }
+    this._taskControllers.clear();
+  }
+
+  /** Number of task slots currently tracking an AbortController. */
+  getInflightCount(): number {
+    return this._taskControllers.size;
+  }
+
+  /** Last request's correlation ID and HTTP status, for diagnostics. */
+  getLastRequestInfo(): { requestId: string; status?: number; ts: number } | null {
+    return this._lastRequestInfo;
+  }
+
+  /** Returns the active API key — prefers ZerlyKeyManager, falls back to settings. */
   getApiKey(): string {
+    if (this._keyManager) {
+      const kmKey = this._keyManager.getCachedKey();
+      if (kmKey) return kmKey;
+    }
+    // Fallback: read from workspace config (supports manual edits during development)
     const cfg = vscode.workspace.getConfiguration('zerly');
     const zerlyKey = cfg.get<string>('zerlyApiKey');
-    if (zerlyKey && zerlyKey.trim().length > 0) {
-      return zerlyKey.trim();
-    }
-    return '';
+    return zerlyKey?.trim() ?? '';
   }
 
   /** Returns the model to use: custom override if set, otherwise the Zerly default. */
@@ -59,7 +92,6 @@ export class AIService {
     const cfg = vscode.workspace.getConfiguration('zerly');
     const customModelKey = cfg.get<string>('customModelApiKey');
     if (customModelKey && customModelKey.trim().length > 0) {
-      // When a custom key is provided, honour the custom model setting
       const customModel = cfg.get<string>('customModel');
       if (customModel && customModel.trim()) {
         return customModel.trim();
@@ -84,6 +116,9 @@ export class AIService {
   /** Tracks one AbortController per task type so new requests cancel stale ones. */
   private readonly _taskControllers = new Map<string, AbortController>();
 
+  /** Updated after every completed request — feeds into diagnostics. */
+  private _lastRequestInfo: { requestId: string; status?: number; ts: number } | null = null;
+
   private _sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -92,12 +127,14 @@ export class AIService {
 
   /**
    * Sends a chat-completion request to the Zerly API.
-   * - taskKey: when provided, any previous in-flight request for the same task
-   *   is aborted before this one starts (prevents stale responses).
-   * - Retries up to 2 times with exponential backoff (1 s, 2 s) on server
-   *   errors (5xx) and transient network failures. Auth/rate-limit errors (401,
-   *   403, 429) are returned immediately without retrying.
-   * - API key is NEVER written to any log.
+   *
+   * Key invariants:
+   *  - taskKey: cancels any prior request for the same task (e.g. double-click Analyze).
+   *  - capturedKeyVersion: if the API key rotates mid-request the response is discarded.
+   *  - Every request carries Cache-Control: no-store and X-Request-Id for freshness.
+   *  - Retries up to 2x with 1 s / 2 s exponential backoff on 5xx / network failures.
+   *  - 401 / 403 / 429 are returned immediately without retry; 401/403 also prompt reconnect.
+   *  - The API key is NEVER written to any log.
    */
   private async _call(
     messages: ZerlyMessage[],
@@ -110,10 +147,17 @@ export class AIService {
       return '⚠️ Connect your Zerly account to activate AI features. Add your API key in Settings → Zerly AI → Zerly API Key.';
     }
 
+    // Capture current key version — used at the end to detect key rotation mid-request.
+    const capturedKeyVersion = this._keyManager?.keyVersion ?? 0;
+    const requestId = generateRequestId();
     const model = this._getModel();
-    console.log(`[Zerly] Calling model: ${model}`);
 
-    // Abort the previous request for this task type and register the new one
+    zerlyLog('request-start', `Task: ${taskKey ?? 'ad-hoc'} model: ${model} keyVersion: ${capturedKeyVersion}`, {
+      requestId,
+      meta: { taskKey: taskKey ?? 'ad-hoc', keyVersion: capturedKeyVersion },
+    });
+
+    // Cancel the stale request for the same task and register this one.
     if (taskKey) {
       this._taskControllers.get(taskKey)?.abort();
       this._taskControllers.set(taskKey, new AbortController());
@@ -124,12 +168,11 @@ export class AIService {
     const MAX_RETRIES = 2;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      // Bail early if the task was superseded
       if (taskSignal?.aborted) {
+        zerlyLog('ignored-stale-response', 'Task superseded — cancelled before attempt', { requestId });
         return '⚠️ Request was cancelled.';
       }
 
-      // Exponential backoff before retries
       if (attempt > 0) {
         await this._sleep(1_000 * attempt); // 1 s, then 2 s
         if (taskSignal?.aborted) {
@@ -137,11 +180,9 @@ export class AIService {
         }
       }
 
-      // Per-attempt controller handles the 30 s timeout
       const attemptController = new AbortController();
       const timeoutId = setTimeout(() => attemptController.abort(), TIMEOUT_MS);
 
-      // Forward task cancellation into this attempt's signal
       let onTaskAbort: (() => void) | null = null;
       if (taskSignal) {
         onTaskAbort = () => attemptController.abort();
@@ -160,9 +201,14 @@ export class AIService {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            // NOTE: key is passed in the Authorization header only — never logged
+            // Key passed only in this header — never appears in logs
             'Authorization': `Bearer ${apiKey}`,
             'X-Title': 'Zerly AI',
+            // Freshness headers — prevent stale proxy/CDN responses
+            'Cache-Control': 'no-store',
+            'Pragma': 'no-cache',
+            // Per-request tracing ID
+            'X-Request-Id': requestId,
           },
           body: JSON.stringify({
             model,
@@ -175,15 +221,35 @@ export class AIService {
 
         cleanup();
 
+        // Key was rotated while the request was in-flight — discard the result.
+        if (this._keyManager && this._keyManager.keyVersion !== capturedKeyVersion) {
+          zerlyLog('ignored-stale-response', 'Key rotated mid-request — discarding response', { requestId });
+          return '⚠️ Request cancelled due to key rotation. Please retry.';
+        }
+
+        this._lastRequestInfo = { requestId, status: response.status, ts: Date.now() };
+        zerlyLog('request-end', `Task: ${taskKey ?? 'ad-hoc'}`, {
+          requestId,
+          status: response.status,
+          meta: { keyVersion: this._keyManager?.keyVersion ?? 0 },
+        });
+
         if (!response.ok) {
-          // Hard failures — do not retry
           if (response.status === 401 || response.status === 403) {
-            return '⚠️ Invalid or unauthorized Zerly API key. Check your key in Settings → Zerly AI → Zerly API Key.';
+            // Prompt reconnect — clear bad key
+            vscode.window.showWarningMessage(
+              'Zerly: API key rejected. Please reconnect your account.',
+              'Connect Zerly'
+            ).then(action => {
+              if (action === 'Connect Zerly') {
+                vscode.env.openExternal(vscode.Uri.parse('https://zerly.tinobritty.me/connect'));
+              }
+            });
+            return '⚠️ Invalid or unauthorized Zerly API key. Reconnect your account to continue.';
           }
           if (response.status === 429) {
             return '⚠️ Rate limit exceeded. Please wait a moment and try again.';
           }
-          // Server errors — retry if attempts remain
           if (response.status >= 500 && attempt < MAX_RETRIES) {
             continue;
           }
@@ -208,19 +274,14 @@ export class AIService {
 
         if (err.name === 'AbortError') {
           if (taskSignal?.aborted) {
+            zerlyLog('ignored-stale-response', 'Task superseded mid-request', { requestId });
             return '⚠️ Request was cancelled.';
           }
-          // Timeout: retry if attempts remain
-          if (attempt < MAX_RETRIES) {
-            continue;
-          }
+          if (attempt < MAX_RETRIES) continue;
           return '⚠️ Request timed out (30s). Check your connection and try again.';
         }
 
-        // Network / fetch error: retry if attempts remain
-        if (attempt < MAX_RETRIES) {
-          continue;
-        }
+        if (attempt < MAX_RETRIES) continue;
         return '⚠️ Network error. Check your connection and try again.';
       }
     }
@@ -294,7 +355,7 @@ Be confident and helpful. Don't be verbose. Use markdown formatting.`,
         content: userMessage,
       },
     ];
-    return this._call(messages, 2048);
+    return this._call(messages, 2048, 'chat');
   }
 
   async analyzeFeatureFlow(query: string, scanResult: ScanResult): Promise<string> {
