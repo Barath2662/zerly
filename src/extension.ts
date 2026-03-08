@@ -199,10 +199,22 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Show welcome message
-  vscode.window.showInformationMessage(
-    "Hey, I'm Zerly. Give me a moment to understand your codebase. 🧠"
-  );
+  // Show appropriate startup notification based on whether an API key is set
+  const zerlyKey = vscode.workspace.getConfiguration('zerly').get<string>('zerlyApiKey');
+  if (zerlyKey?.trim()) {
+    vscode.window.showInformationMessage(
+      "Hey, I'm Zerly. Give me a moment to understand your codebase. 🧠"
+    );
+  } else {
+    vscode.window.showInformationMessage(
+      'Connect your Zerly account to activate AI features.',
+      'Connect Zerly'
+    ).then(action => {
+      if (action === 'Connect Zerly') {
+        vscode.env.openExternal(vscode.Uri.parse('https://zerly.tinobritty.me/connect'));
+      }
+    });
+  }
 
   console.log('Zerly AI activated successfully.');
 }
